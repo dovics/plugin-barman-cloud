@@ -1,35 +1,9 @@
 # Sidecar
 # The container needs to provide and build two components:
 # * barman-cloud
-# * instance plugin
+# * kubectl
 # Both components are built before going into a distroless container
-
-# Build the manager binary
-# GO_VERSION must be passed as a build arg (read from go.mod toolchain directive by Taskfile)
-ARG GO_VERSION
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS gobuilder
-ARG TARGETOS
 ARG TARGETARCH
-
-WORKDIR /workspace
-
-COPY ../go.mod go.mod
-COPY ../go.sum go.sum
-# cache deps before building and copying source so that we don't need to re-download as much
-# and so that source changes don't invalidate our downloaded layer
-RUN go env -w GOPROXY=https://goproxy.cn,direct && go mod download
-
-ENV GOCACHE=/root/.cache/go-build
-ENV GOMODCACHE=/go/pkg/mod
-
-COPY ../cmd/manager/main.go cmd/manager/main.go
-COPY ../api/ api/
-COPY ../internal/ internal/
-
-# Build Go binary for target platform (TARGETOS/TARGETARCH)
-# Docker BuildKit sets these based on --platform flag or defaults to the build host platform
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/manager/main.go
 
 # Build Python virtualenv with all dependencies
 FROM debian:trixie-slim AS pythonbuilder
@@ -100,7 +74,6 @@ LABEL summary="$SUMMARY" \
 
 COPY --from=pythonbuilder /venv /venv
 COPY --from=pythonbuilder /dependencies/usr/lib /usr/lib
-COPY --from=gobuilder /workspace/manager /manager
 
 # Compile all Python bytecode as root to avoid runtime compilation
 USER 0:0

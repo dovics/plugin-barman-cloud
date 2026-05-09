@@ -1,0 +1,6 @@
+# PostgreSQL 备份恢复所需的 RBAC 权限和恢复脚本配置
+# 使用方法: kubectl apply -k config/restore/ -n <目标命名空间>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - restore.yaml

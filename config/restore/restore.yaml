@@ -1,0 +1,111 @@
+# PostgreSQL 备份恢复所需的 RBAC 权限和恢复脚本
+# 使用方法: kubectl apply -f restore.yaml -n <命名空间>
+
+---
+# ServiceAccount - 恢复 Job 使用的服务账号
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: barman-restore-sa
+  labels:
+    app: barman-cloud-restore
+
+---
+# Role - 定义恢复操作所需的权限
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: barman-restore-role
+  labels:
+    app: barman-cloud-restore
+rules:
+  # 操作 Cluster 资源（添加/移除 hibernation annotation）
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+  # 操作 Pod 资源（等待 Pod 启动、执行 pg_isready）
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # 执行 Pod 内部命令（pg_isready）
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+
+---
+# RoleBinding - 将 Role 绑定到 ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: barman-restore-rb
+  labels:
+    app: barman-cloud-restore
+subjects:
+  - kind: ServiceAccount
+    name: barman-restore-sa
+roleRef:
+  kind: Role
+  name: barman-restore-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ConfigMap - 恢复脚本
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: barman-restore-script
+  labels:
+    app: barman-cloud-restore
+data:
+  restore.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "=== 步骤 1/5: 启用 hibernation 停止 PostgreSQL Pod ==="
+    kubectl annotate cluster "$CLUSTER_NAME" -n "$NAMESPACE" cnpg.io/hibernation=on --overwrite
+
+    echo "等待所有 PostgreSQL Pod 停止..."
+    kubectl wait pod -n "$NAMESPACE" -l cnpg.io/cluster="$CLUSTER_NAME" --for=delete --timeout=120s 2>/dev/null || true
+    echo "所有 PostgreSQL Pod 已停止"
+
+    echo "=== 步骤 2/5: 清理旧数据目录 ==="
+    find "$PGDATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+    echo "=== 步骤 3/5: 执行 barman-cloud-restore ==="
+    /venv/bin/barman-cloud-restore $BARMAN_ARGS
+    echo "barman-cloud-restore 完成"
+
+    echo "=== 步骤 4/5: 配置恢复目标 ==="
+    cat >> "$PGDATA_DIR/override.conf" << EOF
+    recovery_target_timeline = '$RECOVERY_TIMELINE'
+    recovery_target_lsn = '$RECOVERY_LSN'
+    recovery_target_action = 'promote'
+    recovery_target_inclusive = true
+    EOF
+
+    echo "创建 recovery.signal..."
+    touch "$PGDATA_DIR/recovery.signal"
+
+    echo "=== 步骤 5/5: 移除 hibernation annotation 唤醒集群 ==="
+    kubectl annotate cluster "$CLUSTER_NAME" -n "$NAMESPACE" cnpg.io/hibernation- --overwrite
+
+    echo "等待 PostgreSQL Pod 启动..."
+    kubectl wait pod -n "$NAMESPACE" -l cnpg.io/cluster="$CLUSTER_NAME" --for=condition=Ready --timeout=600s
+    echo "PostgreSQL Pod 已启动"
+
+    echo "等待 PostgreSQL 数据库就绪..."
+    for i in {1..60}; do
+        PRIMARY_POD=$(kubectl get pod -n "$NAMESPACE" -l cnpg.io/cluster="$CLUSTER_NAME",cnpg.io/instanceRole=primary -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$PRIMARY_POD" ]; then
+            if kubectl exec -n "$NAMESPACE" "$PRIMARY_POD" -c postgres -- pg_isready -q 2>/dev/null; then
+                echo "PostgreSQL 数据库已就绪"
+                break
+            fi
+        fi
+        echo "等待数据库就绪... ($i/60)"
+        sleep 3
+    done
+
+    echo "=== 全部恢复流程完成！==="
